@@ -1,0 +1,234 @@
+---
+title: 'Replicating "What is the best measure of labor market tightness?"'
+author: "Itamar Caspi"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: show
+    highlight: haddock
+    keep_md: no
+    theme: journal
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+abstract: |
+  This notebook includes replication of some of the regression results that appear in ["What is the best measure of labor market tightness?"](https://www.piie.com/blogs/realtime-economic-issues-watch/what-best-measure-labor-market-tightness) by [Jason Furman](https://www.piie.com/experts/senior-research-staff/jason-furman) and [Willson Powell III](https://www.piie.com/experts/former-research-staff/wilson-powell-iii). 
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  eval = TRUE,
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE
+)
+```
+
+
+## Load packages
+```{r}
+library(tidyverse)   # for data wrangling and plots
+library(lubridate)   # for dealing with dates
+library(fredr)       # a FRED api
+library(broom)       # tidying regression output
+library(hrbrthemes)  # fancy plots
+library(gghighlight) # for labeling series in plots
+library(gt)          # fancy tables
+```
+
+
+## Download data from [FRED](https://fred.stlouisfed.org/)
+
+Note: To run this code, you'll first need to get a [FRED API key](https://fred.stlouisfed.org/docs/api/api_key.html) and then set it using the `fredr_set_key()` function.
+
+
+Download data
+```{r}
+params <- list(
+  series_id = c(
+    "PAYEMS", "UNRATE", "LNS12300060", "JTSQUL", "JTSJOL", "UNEMPLOY", "CPILFESL", "PCEPILFE"
+    ),
+  frequency = c("q", "q", "q", "q", "q", "q", "q", "q"),
+  units = c("lin", "lin", "lin", "lin", "lin", "lin", "pc1", "pc1")
+)
+
+df_raw <- pmap_dfr(
+  .l = params,
+  .f = ~ fredr(series_id = ..1, frequency = ..2, units = ..3)
+)
+```
+
+## Preprocess data
+
+Change to "wide" format
+```{r}
+df_wide <- 
+  df_raw %>% 
+  select(date, series_id, value) %>% 
+  pivot_wider(names_from = "series_id", values_from = "value")
+
+head(df_wide)
+```
+
+Calculate and rename variables
+```{r}
+df <- 
+  df_wide %>%
+  mutate(
+    ur       = UNRATE,
+    panr     = 100 - LNS12300060,
+    upjo     = UNEMPLOY / JTSJOL,
+    qr       = 100 - 100 * JTSQUL/PAYEMS,
+    core_cpi = CPILFESL,
+    core_pce = PCEPILFE
+  ) %>% 
+  select(date, ur, panr, upjo, qr, core_cpi, core_pce) %>% 
+  filter(between(date, ymd("2001-01-01"), ymd("2021-07-31")))
+
+head(df)
+```
+
+Transformer variables to Z-scores based on a mean and standard deviation from 2001 to 2018.
+
+First, get mean and standard deviation
+```{r}
+params <- 
+  df %>%
+  filter(date <= ymd("2018-12-31")) %>% 
+  summarise(across(ur:core_pce, list(mean = mean, sd = sd)))
+
+params
+```
+
+
+```{r}
+# generate z-scores
+df_zscore <- 
+  df %>% 
+  mutate(
+    ur       = (ur - params$ur_mean) / params$ur_sd,
+    panr     = (panr - params$panr_mean) / params$panr_sd,
+    upjo     = (upjo - params$upjo_mean) / params$upjo_sd,
+    qr       = (qr - params$qr_mean) / params$qr_sd,
+    core_cpi = (core_cpi - params$core_cpi_mean) / params$core_cpi_sd,
+    core_pce = (core_pce - params$core_pce_mean) / params$core_pce_sd
+  )
+
+head(df_zscore)
+```
+
+
+## Plot time series
+
+Labor market indicators
+```{r}
+df_zscore %>% 
+  select(-starts_with("core")) %>% 
+  pivot_longer(-date, names_to = "name", values_to = "value") %>% 
+  ggplot(aes(date, value, color = name)) + 
+  geom_line(size = 1) +
+  scale_color_viridis_d() +
+  gghighlight(max(value) > -999) +
+  geom_hline(aes(yintercept = 0)) +
+  theme_ipsum() +
+  labs(
+    subtitle = "Quarterly measures of labor market tightness",
+    x = "",
+    y = "Z-score"
+  )
+```
+
+Inflation indicators
+```{r}
+df_zscore %>% 
+  select(date, starts_with("core")) %>% 
+  pivot_longer(-date, names_to = "name", values_to = "value") %>% 
+  ggplot(aes(date, value, color = name)) + 
+  geom_line(size = 1) +
+  scale_color_viridis_d() +
+  gghighlight(max(value) > -999) +
+  geom_hline(aes(yintercept = 0)) +
+  theme_ipsum() +
+  labs(
+    subtitle = "Percent Change in measurments of prices over past 4 quarters",
+    x = "",
+    y = "Z-score"
+  )
+```
+
+
+## Regression analysis
+
+We now estimate a traditional and an autoregressive Phillips curve that relates current measures of slack to changes in prices  over the next year:
+
+$$
+\text { Inflation growth }_{\mathrm{t} \text { to } \mathrm{t}+4 \mathrm{q}}=\beta_{0}+\beta_{1} * \text { Slack }_{t}+\varepsilon_t
+$$
+and
+$$
+\text { Inflation growth }_{\mathrm{t} \text { to } \mathrm{t}+4 \mathrm{q}}=\beta_{0}+\beta_{1} * \text { Slack }_{t}+\text { Inflation growth }_{\mathrm{t}-4\mathrm{q}\text { to } \mathrm{t}}\varepsilon_t
+$$
+
+First, nest the data to make easier to "map" over the different models
+```{r}
+df_nest <- 
+  df_zscore %>% 
+  filter(date <= ymd("2019-12-31")) %>% 
+  pivot_longer(-c(date, core_cpi, core_pce) ,names_to = "name", values_to = "value") %>% 
+  group_by(name) %>% 
+  nest()
+
+head(df_nest)
+```
+
+Next, run the regressions and store the results
+```{r}
+df_results <- 
+  df_nest %>% 
+  mutate(
+    model_cpi    = map(data, ~ lm(core_cpi ~ lag(value, 4), data = .)),
+    model_pce    = map(data, ~ lm(core_pce ~ lag(value, 4), data = .)),
+    model_cpi_ar = map(data, ~ lm(core_cpi ~ lag(value, 4) + lag(core_cpi, 4), data = .)),
+    model_pce_ar = map(data, ~ lm(core_pce ~ lag(value, 4) + lag(core_pce, 4), data = .)),
+    stats_cpi    = map(model_cpi, ~ glance(.)),
+    stats_pce    = map(model_pce, ~ glance(.)),
+    stats_cpi_ar = map(model_cpi_ar, ~ glance(.)),
+    stats_pce_ar = map(model_pce_ar, ~ glance(.))
+  ) %>% 
+  unnest(stats_cpi, stats_pce, stats_cpi_ar, stats_pce_ar) %>%
+  select(name, adj.r.squared, adj.r.squared1, adj.r.squared2, adj.r.squared3)
+```
+
+
+## Results
+
+Print results with the help of the [`gt`](https://gt.rstudio.com/) package
+```{r}
+df_results %>%
+  ungroup() %>% 
+  gt() %>% 
+  tab_header(
+    title = "Adjusted R squared from Phillips cureve regressions"
+  ) %>% 
+  cols_label(
+    name           = "Dependent var.",
+    adj.r.squared  = "Core CPI",
+    adj.r.squared1 = "Core PCE",
+    adj.r.squared2 = "Core CPI",
+    adj.r.squared3 = "Core PCE"
+  ) %>% 
+  tab_spanner(
+    label = "Traditional",
+    columns = c(adj.r.squared, adj.r.squared1)
+  ) %>%
+  tab_spanner(
+    label = "Autoregressive",
+    columns = c(adj.r.squared2, adj.r.squared3)
+  ) %>% 
+  fmt_number(
+    columns = starts_with("adj."),
+    decimals = 2
+  )
+```
+
+For more results and further details, please refer to the [full article](https://www.piie.com/blogs/realtime-economic-issues-watch/what-best-measure-labor-market-tightness).
